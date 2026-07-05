@@ -1,6 +1,6 @@
 # 20i API Endpoints Mind Map
 
-This document provides a visual overview of the 20i Web Hosting API endpoints organized by functionality categories. The project implements 303 out of 335 total endpoints (90.4% coverage).
+This document provides a visual overview of the 20i Web Hosting API endpoints organized by functionality categories. The project implements 271 fully-wired tools out of 324 total endpoints (83.6% coverage; 298 tool definitions, 288 handlers).
 
 ## Mermaid Mind Map
 
@@ -45,7 +45,7 @@ mindmap
 ## ASCII Tree Representation
 
 ```
-20i API Endpoints (303/335 implemented - 90.4% coverage)
+20i API Endpoints (271/324 fully wired - 83.6% coverage)
 ├─ Domains
 │  ├─ Register & Transfer
 │  ├─ Renewal & Expiry
