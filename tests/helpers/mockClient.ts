@@ -25,6 +25,21 @@ export const createMockTwentyIClient = () => {
     delete: jest.fn(),
     patch: jest.fn(),
     getResellerInfo: jest.fn(),
+    // WordPress blueprint methods (src/modules/wordpress-blueprints.ts)
+    getWordPressBlueprints: jest.fn(),
+    toggleWordPressBlueprint: jest.fn(),
+    // Bulk hosting operation methods (src/modules/bulk-operations.ts)
+    bulkBlockCountries: jest.fn(),
+    bulkBlockIpAddresses: jest.fn(),
+    bulkPurgeCdnCache: jest.fn(),
+    bulkDeleteWebPackages: jest.fn(),
+    bulkGetMalwareScanResults: jest.fn(),
+    bulkGenerateSitemaps: jest.fn(),
+    // Web package methods (src/modules/web-package.ts)
+    getPackageWebOverview: jest.fn(),
+    manageWebsiteCdn: jest.fn(),
+    updateWebsiteDocumentRoot: jest.fn(),
+    getCdnCacheHitStats: jest.fn(),
     credentials: mockApiCredentials,
   };
 };

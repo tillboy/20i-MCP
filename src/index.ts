@@ -14,6 +14,25 @@ import {
 import axios, { AxiosInstance } from 'axios';
 import { dirname } from 'path';
 import { fileURLToPath } from 'url';
+import {
+  handleGetPackageWebOverview,
+  handleManageWebsiteCdn,
+  handleUpdateWebsiteDocumentRoot,
+  handleGetCdnCacheHitStats,
+} from './modules/web-package.js';
+import {
+  handleBulkBlockCountries,
+  handleBulkBlockIpAddresses,
+  handleBulkPurgeCdnCache,
+  handleBulkDeleteWebPackages,
+  handleBulkGetMalwareScanResults,
+  handleBulkGenerateSitemaps,
+  assertBulkDeleteConfirmation,
+} from './modules/bulk-operations.js';
+import {
+  handleGetWordPressBlueprints,
+  handleToggleWordPressBlueprint,
+} from './modules/wordpress-blueprints.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -5260,6 +5279,226 @@ class TwentyIClient {
     return response.data;
   }
 
+  // WordPress Blueprint Methods
+
+  /**
+   * List all hosting packages across the reseller account that are currently
+   * enabled as a WordPress blueprint source.
+   *
+   * GET /wordpress_blueprint
+   *
+   * Spec: 200 JSON array of `{ packageId: number, packageName: string }`.
+   * Live-confirmed 2026-07-05 against a real reseller account. In practice
+   * `packageName` is the site's domain, not a display name. No parameters
+   * are documented or accepted for this call.
+   */
+  async getWordPressBlueprints() {
+    const response = await this.apiClient.get('/wordpress_blueprint');
+    return response.data;
+  }
+
+  /**
+   * Enable or disable a WordPress package as a reusable blueprint source.
+   * Toggles the package's current blueprint status: if the package is not
+   * currently a blueprint it will be enabled, if it already is one it will be
+   * disabled. Only packages on the wordpress platform are eligible.
+   *
+   * POST /wordpress_blueprint
+   *
+   * NOTE (unconfirmed request shape): the official API doc (archive/
+   * gitignor_ref_folder/20i_api_doc_2026-07-05.apib, "WordPress Blueprint"
+   * section) documents NO request body for this POST. The `{ packageId }`
+   * body field used here is INFERRED from the endpoint's stated behavior and
+   * the resource path, not lifted from a documented request body, and is
+   * unverified against live behavior.
+   *
+   * NOTE (silent no-op risk): a live probe on 2026-07-05 POSTing an empty
+   * body (`{}`) returned 200 with a bare `0` - i.e. the endpoint returns 200
+   * even for unrecognized bodies, so a wrong field name would silently do
+   * nothing. Verify the toggle took effect via get_wordpress_blueprints.
+   */
+  async toggleWordPressBlueprint(packageId: number) {
+    const response = await this.apiClient.post('/wordpress_blueprint', { packageId });
+    return response.data;
+  }
+
+  // Bulk Hosting Operations Methods
+  //
+  // NOTE: none of these six endpoints were live-probed with a NON-EMPTY package
+  // list. Probes with an empty JSON body returned `200 { result: [] }` instead
+  // of the blueprint's documented bare `package_id -> value` object, so the true
+  // success-path response shape is unconfirmed. These methods deliberately do
+  // NOT unwrap/reshape `response.data` - they pass it through untouched.
+
+  /**
+   * Apply a country-based allow/block access rule across multiple hosting packages simultaneously.
+   *
+   * API Endpoint: POST /hosting/handleBulkBlockCountry
+   *
+   * @param packages List of hosting package IDs to apply the rule to.
+   * @param access   'allow' to permit only the listed countries; any other value blocks them
+   *                 (mirrors POST /package/{packageId}/web/blockedCountries semantics).
+   * @param countries ISO 3166-1 alpha-2 country codes. Pass an empty array to clear all
+   *                   country restrictions on the targeted packages.
+   */
+  async bulkBlockCountries(packages: string[], access: string, countries: string[]) {
+    const response = await this.apiClient.post('/hosting/handleBulkBlockCountry', {
+      packages,
+      access,
+      countries,
+    });
+    return response.data;
+  }
+
+  /**
+   * Apply IP address / CIDR range blocking rules across multiple hosting packages simultaneously.
+   *
+   * API Endpoint: POST /hosting/handleBulkBlockIp
+   *
+   * @param packages     List of hosting package IDs to apply the rule to.
+   * @param ipAddresses  Individual IP addresses and/or CIDR ranges to block. Omit (undefined) to
+   *                      remove all blocked addresses for the targeted packages, mirroring
+   *                      POST /package/{packageId}/web/blockedIpAddresses's "omit to clear" semantics.
+   */
+  async bulkBlockIpAddresses(packages: string[], ipAddresses?: string[]) {
+    const payload: { packages: string[]; ip_addresses?: string[] } = { packages };
+    if (ipAddresses !== undefined) {
+      payload.ip_addresses = ipAddresses;
+    }
+    const response = await this.apiClient.post('/hosting/handleBulkBlockIp', payload);
+    return response.data;
+  }
+
+  /**
+   * Purge the CDN cache across multiple hosting packages simultaneously.
+   *
+   * API Endpoint: POST /hosting/handleBulkCachePurge
+   *
+   * @param packages List of hosting package IDs whose CDN cache should be purged.
+   */
+  async bulkPurgeCdnCache(packages: string[]) {
+    const response = await this.apiClient.post('/hosting/handleBulkCachePurge', { packages });
+    return response.data;
+  }
+
+  /**
+   * DESTRUCTIVE: permanently deletes websites (hosting packages) across multiple package IDs.
+   * Packages with active site migration tasks, or that are a parent of another web, cannot be
+   * deleted and are expected to come back `false` for that package ID rather than being omitted.
+   *
+   * API Endpoint: POST /hosting/handleBulkDeleteWeb
+   *
+   * @param deleteIds    Array of package IDs (as strings) to permanently delete.
+   * @param confirmation Must be exactly "PERMANENTLY DELETE" - anything else throws
+   *                     McpError(InvalidParams) before any HTTP request is made.
+   *
+   * SAFETY: the "PERMANENTLY DELETE" confirmation guard lives INSIDE this method (before any
+   * HTTP call), so no caller can reach the API without the exact confirmation string. The
+   * handleBulkDeleteWebPackages tool handler performs the same check early and relays the
+   * confirmation through to this method-level guard (defense in depth).
+   *
+   * NOTE: this endpoint was NOT live-probed (destructive; live testing against it is forbidden).
+   * Treat `response.data` defensively - it is returned as-is, unreshaped.
+   */
+  async bulkDeleteWebPackages(deleteIds: string[], confirmation: string) {
+    // METHOD-DEPTH SAFETY GUARD: throws McpError(InvalidParams) before any
+    // HTTP call unless confirmation is exactly "PERMANENTLY DELETE".
+    assertBulkDeleteConfirmation(confirmation);
+    const response = await this.apiClient.post('/hosting/handleBulkDeleteWeb', {
+      'delete-id': deleteIds,
+    });
+    return response.data;
+  }
+
+  /**
+   * Retrieve the latest malware scan results across multiple hosting packages simultaneously.
+   *
+   * API Endpoint: POST /hosting/handleBulkMalwareScan
+   *
+   * @param packages List of hosting package IDs to retrieve malware scan results for.
+   */
+  async bulkGetMalwareScanResults(packages: string[]) {
+    const response = await this.apiClient.post('/hosting/handleBulkMalwareScan', { packages });
+    return response.data;
+  }
+
+  /**
+   * Generate and retrieve sitemaps across multiple hosting packages simultaneously.
+   *
+   * API Endpoint: POST /hosting/handleBulkSitemapGeneration
+   *
+   * @param packages List of hosting package IDs to generate/retrieve sitemaps for.
+   */
+  async bulkGenerateSitemaps(packages: string[]) {
+    const response = await this.apiClient.post('/hosting/handleBulkSitemapGeneration', { packages });
+    return response.data;
+  }
+
+  // Web Package Methods (package/{id}/web endpoints)
+
+  /**
+   * Retrieve basic website information for a hosting package: platform,
+   * backup status, setup completion, and attached domain names.
+   *
+   * GET /package/{packageId}/web/info
+   *
+   * Per the 20i spec, the 200 body is:
+   * `{ id, hasBackups, label, name, names, platform, setupComplete, typeRef, hasSsl }`.
+   * A live probe (2026-07-05) showed `id` and `typeRef` can be numeric rather
+   * than the spec's string placeholder, and `label` can be `null`. `hasSsl`
+   * was not present in that sample.
+   */
+  async getPackageWebOverview(packageId: string) {
+    const response = await this.apiClient.get(`/package/${packageId}/web/info`);
+    return response.data;
+  }
+
+  /**
+   * Enable, disable, or purge the CDN for a website's hosting package.
+   * Disabling adds the `no_nginx_static` feature flag (removed again on
+   * enable); both enable and disable also trigger an automatic cache purge.
+   *
+   * POST /package/{packageId}/web/manageCdn  { action }
+   *
+   * Spec documents a bare `true` 200 body on success; a live probe
+   * (2026-07-05) with a missing action returned 200 `{ result: false }`.
+   * Callers should treat both a bare `true` and `{ result: true }` as success.
+   */
+  async manageWebsiteCdn(packageId: string, action: 'enable' | 'disable' | 'purge') {
+    const response = await this.apiClient.post(`/package/${packageId}/web/manageCdn`, { action });
+    return response.data;
+  }
+
+  /**
+   * Update the document root subdirectory for one or more domains/subdomains
+   * already attached to this website's hosting package.
+   *
+   * POST /package/{packageId}/web/updateDocRoot  { update }
+   *
+   * `update` is a map of domain name -> new document root subdirectory,
+   * e.g. `{ "example.com": "public_html/mysite" }`.
+   *
+   * Callers must handle both a bare array and a `{ result: [...] }` wrapper shape.
+   */
+  async updateWebsiteDocumentRoot(packageId: string, update: Record<string, string>) {
+    const response = await this.apiClient.post(`/package/${packageId}/web/updateDocRoot`, { update });
+    return response.data;
+  }
+
+  /**
+   * Retrieve CDN cache hit/miss counts for a website's hosting package over
+   * a recent time window.
+   *
+   * POST /package/{packageId}/web/cdnStatsCacheHits  { period }
+   *
+   * `period` must be exactly one of `Last1Hour`, `Last24Hours`, or
+   * `Last7Days`; any other value results in a NotFoundException (404).
+   */
+  async getCdnCacheHitStats(packageId: string, period: 'Last1Hour' | 'Last24Hours' | 'Last7Days') {
+    const response = await this.apiClient.post(`/package/${packageId}/web/cdnStatsCacheHits`, { period });
+    return response.data;
+  }
+
 }
 
 const server = new Server(
@@ -5367,7 +5606,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'get_hosting_package_web_info',
-        description: 'Get web-specific hosting package information',
+        description:
+          'Get the full web object for a hosting package (GET /package/{packageId}/web) - the complete website configuration. For a lightweight summary (platform, attached names, backup/setup status via GET /package/{packageId}/web/info), use get_package_web_overview instead.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -11322,6 +11562,218 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ['vps_id', 'renewal_period'],
         },
       },
+      {
+        name: 'get_wordpress_blueprints',
+        description:
+          'List all hosting packages across the reseller account that are currently enabled as a WordPress blueprint source',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+        },
+      },
+      {
+        name: 'toggle_wordpress_blueprint',
+        description:
+          'Enable or disable a WordPress package as a reusable blueprint source, toggling its current blueprint status (enables it if not currently a blueprint, disables it if already one; only packages on the wordpress platform are eligible). CAUTION: the official API doc documents no request body for POST /wordpress_blueprint - the { packageId } body field this tool sends is inferred and unverified against live behavior, and the endpoint returns 200 "0" even for unrecognized bodies (silent no-op risk); verify the toggle took effect with get_wordpress_blueprints afterwards.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            package_id: {
+              type: 'number',
+              description:
+                'The Package ID (from list/get packages) of the WordPress package whose blueprint status should be toggled',
+            },
+          },
+          required: ['package_id'],
+        },
+      },
+      {
+        name: 'bulk_block_countries',
+        description: 'Apply a country-based allow/block access rule across multiple hosting packages simultaneously',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            packages: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'List of hosting package IDs to apply the country-blocking rule to',
+            },
+            access: {
+              type: 'string',
+              description: 'Use "allow" to permit only the listed countries; any other value blocks the listed countries',
+            },
+            countries: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'ISO 3166-1 alpha-2 country codes the rule applies to. Pass an empty array to remove all country restrictions on the targeted packages',
+            },
+          },
+          required: ['packages', 'access', 'countries'],
+        },
+      },
+      {
+        name: 'bulk_block_ip_addresses',
+        description: 'Apply IP address and CIDR range blocking rules across multiple hosting packages simultaneously',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            packages: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'List of hosting package IDs to apply the IP blocking rule to',
+            },
+            ip_addresses: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Individual IP addresses and/or CIDR ranges to block, applied to all targeted packages. To remove all blocked addresses for those packages, omit this field entirely (deliberate omission); an explicit null is ambiguous and rejected',
+            },
+          },
+          required: ['packages'],
+        },
+      },
+      {
+        name: 'bulk_purge_cdn_cache',
+        description: 'Purge the CDN cache across multiple hosting packages simultaneously',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            packages: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'List of hosting package IDs whose CDN cache should be purged',
+            },
+          },
+          required: ['packages'],
+        },
+      },
+      {
+        name: 'bulk_delete_web_packages',
+        description: 'DESTRUCTIVE: permanently deletes websites (hosting packages) across multiple package IDs. Packages with active migrations or that are a parent of another web will fail and return false. Requires the exact confirmation text "PERMANENTLY DELETE".',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            confirmation: {
+              type: 'string',
+              description: 'Must be exactly "PERMANENTLY DELETE" to proceed - safety guard checked before any API call is made',
+            },
+            delete_id: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Array of package IDs (as strings) to permanently delete',
+            },
+          },
+          required: ['confirmation', 'delete_id'],
+        },
+      },
+      {
+        name: 'bulk_get_malware_scan_results',
+        description: 'Retrieve the latest malware scan results across multiple hosting packages simultaneously',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            packages: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'List of hosting package IDs to retrieve malware scan results for',
+            },
+          },
+          required: ['packages'],
+        },
+      },
+      {
+        name: 'bulk_generate_sitemaps',
+        description: 'Generate and retrieve sitemaps across multiple hosting packages simultaneously',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            packages: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'List of hosting package IDs to generate/retrieve sitemaps for',
+            },
+          },
+          required: ['packages'],
+        },
+      },
+      {
+        name: 'get_package_web_overview',
+        description:
+          'Retrieve a lightweight website summary for a hosting package (GET /package/{packageId}/web/info): platform, backup status, setup completion, and attached domain names. For the full web object (complete website configuration via GET /package/{packageId}/web), use get_hosting_package_web_info instead.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            package_id: {
+              type: 'string',
+              description: 'The Package ID retrieved from get packages.',
+            },
+          },
+          required: ['package_id'],
+        },
+      },
+      {
+        name: 'manage_website_cdn',
+        description:
+          "Enable, disable, or purge the CDN for a website's hosting package. Disabling adds the no_nginx_static feature flag and removes it on enable; both enable and disable also trigger an automatic cache purge.",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            package_id: {
+              type: 'string',
+              description: 'The Package ID retrieved from get packages.',
+            },
+            action: {
+              type: 'string',
+              enum: ['enable', 'disable', 'purge'],
+              description: 'The CDN action to perform. One of enable, disable, or purge.',
+            },
+          },
+          required: ['package_id', 'action'],
+        },
+      },
+      {
+        name: 'update_website_document_root',
+        description:
+          "Update the document root subdirectory for one or more domains or subdomains already attached to a website's hosting package.",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            package_id: {
+              type: 'string',
+              description: 'The Package ID retrieved from get packages.',
+            },
+            update: {
+              type: 'object',
+              description:
+                'Map of domain name to new document root subdirectory, e.g. {"example.com": "public_html/mysite"}. Each key must already be a domain/subdomain attached to this web service.',
+              additionalProperties: {
+                type: 'string',
+              },
+            },
+          },
+          required: ['package_id', 'update'],
+        },
+      },
+      {
+        name: 'get_cdn_cache_hit_stats',
+        description:
+          "Retrieve CDN cache hit and miss counts for a website's hosting package over a specified recent time window.",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            package_id: {
+              type: 'string',
+              description: 'The Package ID retrieved from get packages.',
+            },
+            period: {
+              type: 'string',
+              enum: ['Last1Hour', 'Last24Hours', 'Last7Days'],
+              description:
+                'The time window to report on. Must be exactly one of Last1Hour, Last24Hours, or Last7Days.',
+            },
+          },
+          required: ['package_id', 'period'],
+        },
+      },
     ],
   };
 });
@@ -15419,10 +15871,52 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ],
         };
 
+      case 'get_wordpress_blueprints':
+        return await handleGetWordPressBlueprints(twentyIClient);
+
+      case 'toggle_wordpress_blueprint':
+        return await handleToggleWordPressBlueprint(twentyIClient, args);
+
+      case 'bulk_block_countries':
+        return await handleBulkBlockCountries(twentyIClient, args);
+
+      case 'bulk_block_ip_addresses':
+        return await handleBulkBlockIpAddresses(twentyIClient, args);
+
+      case 'bulk_purge_cdn_cache':
+        return await handleBulkPurgeCdnCache(twentyIClient, args);
+
+      case 'bulk_delete_web_packages':
+        return await handleBulkDeleteWebPackages(twentyIClient, args);
+
+      case 'bulk_get_malware_scan_results':
+        return await handleBulkGetMalwareScanResults(twentyIClient, args);
+
+      case 'bulk_generate_sitemaps':
+        return await handleBulkGenerateSitemaps(twentyIClient, args);
+
+      case 'get_package_web_overview':
+        return await handleGetPackageWebOverview(twentyIClient, args);
+
+      case 'manage_website_cdn':
+        return await handleManageWebsiteCdn(twentyIClient, args);
+
+      case 'update_website_document_root':
+        return await handleUpdateWebsiteDocumentRoot(twentyIClient, args);
+
+      case 'get_cdn_cache_hit_stats':
+        return await handleGetCdnCacheHitStats(twentyIClient, args);
+
       default:
         throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
     }
   } catch (error) {
+    // Preserve already-classified MCP errors (e.g. InvalidParams from input
+    // validation or safety guards) instead of rewrapping them as InternalError,
+    // so clients receive the correct error code.
+    if (error instanceof McpError) {
+      throw error;
+    }
     throw new McpError(
       ErrorCode.InternalError,
       `Tool execution failed: ${error instanceof Error ? error.message : String(error)}`

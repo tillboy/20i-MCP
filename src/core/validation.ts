@@ -12,12 +12,28 @@ export function validateString(value: any, fieldName: string): string {
 }
 
 /**
- * Validates that a value is a positive number
+ * Validates that a value is a positive integer.
+ *
+ * Accepted inputs (everything existing call sites legitimately pass - years,
+ * TTLs, package IDs): positive integer numbers, and strings containing a
+ * positive integer (e.g. "3269253", since MCP clients sometimes send numeric
+ * IDs as strings).
+ *
+ * Rejected: booleans, arrays, objects, null/undefined, NaN, +/-Infinity,
+ * non-integers (e.g. 2.5), zero, and negatives. Previously `Number(value)`
+ * coercion silently accepted `true` (1) and `[123]` (123).
  */
 export function validatePositiveNumber(value: any, fieldName: string): number {
-  const num = Number(value);
-  if (isNaN(num) || num <= 0) {
-    throw new ValidationError(`${fieldName} must be a positive number`);
+  let num: number;
+  if (typeof value === 'number') {
+    num = value;
+  } else if (typeof value === 'string' && value.trim() !== '') {
+    num = Number(value.trim());
+  } else {
+    throw new ValidationError(`${fieldName} must be a positive integer`);
+  }
+  if (!Number.isInteger(num) || num <= 0) {
+    throw new ValidationError(`${fieldName} must be a positive integer`);
   }
   return num;
 }
