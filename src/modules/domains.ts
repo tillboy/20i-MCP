@@ -29,7 +29,7 @@ export class DomainsModule {
       throw new Error('Unable to determine reseller ID from account information');
     }
     
-    return await this.client.get(`/reseller/${resellerId}/domain/${domainId}`);
+    return await this.client.get(`/package/${domainId}/domain/${domainId}`);
   }
 
   async getDnsRecords(domainId: string) {
@@ -40,7 +40,7 @@ export class DomainsModule {
       throw new Error('Unable to determine reseller ID from account information');
     }
     
-    return await this.client.get(`/reseller/${resellerId}/domain/${domainId}/dns`);
+    return await this.client.get(`/package/${domainId}/domain/${domainId}/dns`);
   }
 
   async updateDnsRecord(domainId: string, recordData: any) {
@@ -51,7 +51,7 @@ export class DomainsModule {
       throw new Error('Unable to determine reseller ID from account information');
     }
     
-    return await this.client.post(`/reseller/${resellerId}/domain/${domainId}/dns`, recordData);
+    return await this.client.post(`/package/${domainId}/domain/${domainId}/dns`, recordData);
   }
 
   async registerDomain(domainData: {
@@ -166,7 +166,7 @@ export class DomainsModule {
 
   async getDomainWhois(packageId: string, domainId: string) {
     try {
-      return await this.client.get(`/package/${packageId}/domain/${domainId}/whois`);
+      return await this.client.get(`/package/${packageId}/domain/${domainId}/whois`, { rawText: true, responseType: 'text', transformResponse: [(d: any) => d] });
     } catch (error: any) {
       if (error.response?.status === 404) {
         throw new Error('Domain not found or WHOIS data not available');

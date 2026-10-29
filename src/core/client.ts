@@ -60,6 +60,11 @@ export class TwentyIClient {
       (response) => {
         const contentType = response.headers['content-type'];
         
+        // Endpoints that legitimately return plain text (e.g. WHOIS) opt out of the JSON guard
+        if ((response.config as any)?.rawText) {
+          return response;
+        }
+
         // If we got a string response that looks like JavaScript object literal, try to convert it
         if (typeof response.data === 'string' && response.data.trim()) {
           const trimmedData = response.data.trim();

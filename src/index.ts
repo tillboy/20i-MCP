@@ -91,6 +91,11 @@ class TwentyIClient {
         // Check if response is JSON
         const contentType = response.headers['content-type'];
         
+        // Endpoints that legitimately return plain text (e.g. WHOIS) opt out of the JSON guard
+        if ((response.config as any)?.rawText) {
+          return response;
+        }
+
         // If we got a string response that looks like JavaScript object literal, try to convert it
         if (typeof response.data === 'string' && response.data.trim()) {
           const trimmedData = response.data.trim();
@@ -234,17 +239,38 @@ class TwentyIClient {
     return response.data;
   }
 
-  async getDomainInfo(domainId: string) {
-    const resellerInfo = await this.getResellerInfo();
-    const resellerId = resellerInfo?.id;
-    
-    if (!resellerId) {
-      throw new Error('Unable to determine reseller ID from account information');
+  /**
+   * Resolve a domain reference (numeric ID or domain name) to its 20i domain ID.
+   * Per the 20i API blueprint, domain endpoints live under
+   * /package/{packageId}/domain/{domainId}; for a registered domain the domain
+   * service ID is used as packageId unless a package_id is supplied.
+   */
+  async resolveDomainRef(domainRef: string, packageId?: string): Promise<{ packageId: string; domainId: string }> {
+    let domainId = String(domainRef).trim();
+    if (!/^\d+$/.test(domainId)) {
+      const domains: any = await this.listDomains();
+      const list: any[] = Array.isArray(domains) ? domains : (domains?.domains || []);
+      const match = list.find((d: any) => String(d?.name).toLowerCase() === domainId.toLowerCase());
+      if (!match) {
+        throw new Error(`Domain "${domainRef}" not found in this 20i account`);
+      }
+      domainId = String(match.id);
     }
-    
-    const response = await this.apiClient.get(`/reseller/${resellerId}/domain/${domainId}`);
+    return { packageId: packageId ? String(packageId) : domainId, domainId };
+  }
+
+  async getDomainInfo(domainId: string, packageId?: string) {
+    const ref = await this.resolveDomainRef(domainId, packageId);
+    const response = await this.apiClient.get(`/package/${ref.packageId}/domain/${ref.domainId}`);
     return response.data;
   }
+
+  async getDomainNameservers(domainId: string, packageId?: string) {
+    const ref = await this.resolveDomainRef(domainId, packageId);
+    const response = await this.apiClient.get(`/package/${ref.packageId}/domain/${ref.domainId}/nameservers`);
+    return response.data;
+  }
+
 
   async listHostingPackages() {
     // Use the correct package endpoint to list all packages
@@ -313,29 +339,19 @@ class TwentyIClient {
     return response.data;
   }
 
-  async getDnsRecords(domainId: string) {
-    const resellerInfo = await this.getResellerInfo();
-    const resellerId = resellerInfo?.id;
-    
-    if (!resellerId) {
-      throw new Error('Unable to determine reseller ID from account information');
-    }
-    
-    const response = await this.apiClient.get(`/reseller/${resellerId}/domain/${domainId}/dns`);
+  async getDnsRecords(domainId: string, packageId?: string) {
+    const ref = await this.resolveDomainRef(domainId, packageId);
+    const response = await this.apiClient.get(`/package/${ref.packageId}/domain/${ref.domainId}/dns`);
     return response.data;
   }
 
-  async updateDnsRecord(domainId: string, recordData: any) {
-    const resellerInfo = await this.getResellerInfo();
-    const resellerId = resellerInfo?.id;
-    
-    if (!resellerId) {
-      throw new Error('Unable to determine reseller ID from account information');
-    }
-    
-    const response = await this.apiClient.post(`/reseller/${resellerId}/domain/${domainId}/dns`, recordData);
+
+  async updateDnsRecord(domainId: string, recordData: any, packageId?: string) {
+    const ref = await this.resolveDomainRef(domainId, packageId);
+    const response = await this.apiClient.post(`/package/${ref.packageId}/domain/${ref.domainId}/dns`, recordData);
     return response.data;
   }
+
 
   async registerDomain(domainData: {
     name: string;
@@ -1932,7 +1948,12 @@ class TwentyIClient {
   async getDomainWhois(packageId: string, domainId: string) {
     // Get live WHOIS data for domain
     try {
-      const response = await this.apiClient.get(`/package/${packageId}/domain/${domainId}/whois`);
+      const ref = await this.resolveDomainRef(domainId, packageId);
+      const response = await this.apiClient.get(`/package/${ref.packageId}/domain/${ref.domainId}/whois`, { rawText: true, responseType: 'text', transformResponse: [(d: any) => d] } as any);
+      if (typeof response.data === 'string') {
+        const raw = response.data.trim();
+        try { return JSON.parse(raw); } catch { return raw; }
+      }
       return response.data;
     } catch (error: any) {
       if (error.response?.status === 404) {
@@ -5276,8 +5297,11 @@ const server = new Server(
 
 const twentyIClient = new TwentyIClient();
 
+// Tools that are declared below but have no handler; hidden so clients don't call them
+const UNIMPLEMENTED_TOOLS = new Set<string>(["configure_dnssec", "manage_virtual_nameservers", "configure_advanced_dns_records", "configure_dns_security_monitoring", "setup_third_party_dns_integration", "manage_dns_backup_restore", "configure_dns_templates", "perform_dns_bulk_operations", "manage_dns_api_access", "get_dns_troubleshooting_tools", "manage_domain_transfer_operations", "get_epp_code_management", "manage_domain_verification_systems", "manage_domain_bulk_operations", "get_domain_portfolio_management", "manage_domain_privacy_control", "get_advanced_whois_management", "shutdown_vps", "get_vps_ip_addresses", "change_vps_password", "get_vps_operating_systems", "get_vps_vnc_access", "get_vps_cpanel_access", "get_vps_addon", "update_vps_name", "order_vps", "renew_vps"]);
+
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
+  const result = {
     tools: [
       {
         name: 'get_reseller_info',
@@ -5311,7 +5335,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             domain_id: {
               type: 'string',
-              description: 'The domain ID to get information for',
+              description: 'The domain ID or domain name',
+            },
+            package_id: {
+              type: 'string',
+              description: 'Optional package ID for the domain (defaults to the domain ID)',
+            },
+          },
+          required: ['domain_id'],
+        },
+      },
+      {
+        name: 'get_domain_nameservers',
+        description: 'Get the nameservers registered at the registry for a domain (read-only)',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            domain_id: {
+              type: 'string',
+              description: 'The domain ID or domain name',
+            },
+            package_id: {
+              type: 'string',
+              description: 'Optional package ID for the domain (defaults to the domain ID)',
             },
           },
           required: ['domain_id'],
@@ -5449,7 +5495,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             domain_id: {
               type: 'string',
-              description: 'The domain ID to get DNS records for',
+              description: 'The domain ID or domain name',
+            },
+            package_id: {
+              type: 'string',
+              description: 'Optional package ID for the domain (defaults to the domain ID)',
             },
           },
           required: ['domain_id'],
@@ -7933,14 +7983,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             package_id: {
               type: 'string',
-              description: 'The package ID containing the domain',
+              description: 'Optional package ID (defaults to the domain ID)',
             },
             domain_id: {
               type: 'string',
-              description: 'The domain ID to get WHOIS data for',
+              description: 'The domain ID or domain name',
             },
           },
-          required: ['package_id', 'domain_id'],
+          required: ['domain_id'],
         },
       },
       {
@@ -11324,6 +11374,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
     ],
   };
+  return { tools: result.tools.filter((tool) => !UNIMPLEMENTED_TOOLS.has(tool.name)) };
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -11411,8 +11462,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           );
         }
 
+      case 'get_domain_nameservers': {
+        const nameservers = await twentyIClient.getDomainNameservers(args.domain_id as string, args.package_id as string | undefined);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(nameservers, null, 2),
+            },
+          ],
+        };
+      }
+
       case 'get_domain_info':
-        const domainInfo = await twentyIClient.getDomainInfo(args.domain_id as string);
+        const domainInfo = await twentyIClient.getDomainInfo(args.domain_id as string, args.package_id as string | undefined);
         return {
           content: [
             {
@@ -11521,7 +11584,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
       case 'get_dns_records':
-        const dnsRecords = await twentyIClient.getDnsRecords(args.domain_id as string);
+        const dnsRecords = await twentyIClient.getDnsRecords(args.domain_id as string, args.package_id as string | undefined);
         return {
           content: [
             {
@@ -11537,7 +11600,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           name: args.name,
           value: args.value,
           ttl: args.ttl || 3600,
-        });
+        }, args.package_id as string | undefined);
         return {
           content: [
             {
@@ -13338,7 +13401,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(whoisData, null, 2),
+              text: typeof whoisData === 'string' ? whoisData : JSON.stringify(whoisData, null, 2),
             },
           ],
         };
